@@ -8,17 +8,64 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 #include <Ticker.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define OLED_RESET 4
+Adafruit_SSD1306 display(OLED_RESET);
+#if (SSD1306_LCDHEIGHT != 64)
+#error("Height incorrect, please fix Adafruit_SSD1306.h!");
+#endif
 
 
-#define pinTSNS1 33
-#define pinTSNS2 27
-#define pinTSNS3 2
-// Data wire is plugged into GPIO 16 on the ESP32
+#define LOGO16_GLCD_HEIGHT 8 
+#define LOGO16_GLCD_WIDTH  12 
+static const unsigned char PROGMEM logo16_glcd_bmp[] =
+{ B00000000, B00011111,
+  B11111000, B01011111,
+  B01110000, B01011111,
+  B00100001, B01011111,
+  B00100001, B01011111,
+  B00100101, B01011111,
+  B00100101, B01011111,
+  B00100101, B01011111,
+ };
+
+#define BMPSNOW_GLCD_HEIGHT 15 
+#define BMPSNOW_GLCD_WIDTH  16 
+static const unsigned char PROGMEM bmpSnow16x16[] =
+{ 
+  //0x01, 0x80,
+  0x05, 0xA0,
+  0x17, 0xE8,
+  0x93, 0xC9,
+  0xF1, 0x8F,
+  0x39, 0x9C,
+  0xEF, 0xF7,
+  0xF3, 0xC0,
+  0x03, 0xC0,
+  0xEF, 0xF7,
+  0x39, 0x9C,
+  0xF1, 0x8F,
+  0x93, 0xC9,
+  0x37, 0xE8,
+  0x05, 0xA0,
+  0x01, 0x80,
+ };
+
+
+// GPIO 39,38,37,36,35,34 were not working as DIG OUTS... found out they are input only
+#define pinoutACMAIN 26
+#define pinoutAUXFAN 25
+#define pinoutEVAPPUMP 27
+#define pinoutHBLED 2
+
+#define pininDISPMODE 39
+#define pininCOOLMODE 33
+#define pininH20      32
+
 #define ONE_WIRE_BUS 16
 #define TEMPERATURE_PRECISION 12 // Lower resolution
-
-
-uint8_t aryLeds[] = { pinTSNS1,pinTSNS2,pinTSNS3};
 // Setup a oneWire instance to communicate with any OneWire devices (not just Maxim/Dallas temperature ICs)
 OneWire oneWire(ONE_WIRE_BUS);
 // Pass our oneWire reference to Dallas Temperature. 
@@ -65,10 +112,8 @@ const long interval = 10000;
  
 float temperature = 0;
 float humidity = 0;
-
-// LED Pin
-const int ledPin = 2;
-
+String strMqttRxdTopic = "";
+String strMqttRxdMsg = "";
 /** Task handle for the 1 wire temp sensor read task */
 TaskHandle_t thdlOneWire = NULL;
 /** Ticker for temperature reading */
@@ -101,16 +146,10 @@ void tskOneWire(void *pvParameters) {
           if(sensors.getAddress(tempDeviceAddress, i))
           {
             // Output the device ID
-            Serial.print("Temperature for device: ");
+            Serial.print(" from device: ");
             Serial.println(i,DEC);
             // It responds almost immediately. Let's print out the data
             tempCH[i] = printTemperature(tempDeviceAddress); // Use a simple function to print out the data
-        
-            digitalWrite(aryLeds[0], LOW); 
-            digitalWrite(aryLeds[1], LOW);
-            digitalWrite(aryLeds[2], LOW);
-                 
-            digitalWrite(aryLeds[i], HIGH); 
           } 
           //else ghost device! Check your power requirements and cabling
       }
@@ -180,11 +219,6 @@ void CreateTaskOneWire(void)
  */
 void InitOneWireSensors(void)
 {
-    pinMode(pinTSNS1, OUTPUT);  
-    pinMode(pinTSNS2, OUTPUT);  
-    pinMode(pinTSNS3, OUTPUT);  
-  
-
   // Start up the library
   sensors.begin();
 
@@ -347,6 +381,12 @@ void tskPubMqtt(void *pvParameters) {
         client.publish("/TOHOST/GET/TEMP/ROOM",string2char(String(tempCH[0])));
         client.publish("/TOHOST/GET/TEMP/ATIC",string2char(String(tempCH[1])));
         client.publish("/TOHOST/GET/TEMP/ACOIL",string2char(String(tempCH[2])));
+
+        client.publish("/TOHOST/GET/PIN/COOLMODE",string2char(String(digitalRead(pininCOOLMODE))));
+        client.publish("/TOHOST/GET/PIN/H20",string2char(String(digitalRead(pininH20))));
+        client.publish("/TOHOST/GET/PIN/DISPMODE",string2char(String(digitalRead(pininDISPMODE))));
+        
+        digitalWrite(pinoutHBLED,!digitalRead(pinoutHBLED));
       }
       bSentMqtt = true;
     }
@@ -360,7 +400,7 @@ void CreateTaskPubMqtt(void)
   xTaskCreatePinnedToCore(
       tskPubMqtt,                      /* Function to implement the task */
       "Publish Mqtt",                    /* Name of the task */
-      8000,                          /* Stack size in words */
+      2000,                          /* Stack size in words */
       NULL,                          /* Task input parameter */
       5,                              /* Priority of the task */
       &thdlMqttPub,                /* Task handle. */
@@ -373,9 +413,10 @@ void CreateTaskPubMqtt(void)
     // Start Publishing Mqtt data every x seconds
     tkrTriggerMqttPub.attach(5, triggerPubMqtt);
   }
-
   // Signal end of setup() to OneWire task 
   taskMqttPubEnabled = true;
+
+  pinMode(pinoutHBLED,OUTPUT);
 }
 
 
@@ -386,42 +427,189 @@ void callback(char* topic, byte* message, unsigned int length) {
   Serial.print("Message arrived on topic: ");
   Serial.print(topic);
   Serial.print(". Message: ");
-  String messageTemp;
+  //String messageTemp;
   
+  strMqttRxdTopic = topic;
   for (int i = 0; i < length; i++) {
     Serial.print((char)message[i]);
-    messageTemp += (char)message[i];
+    strMqttRxdMsg += (char)message[i];
   }
   Serial.println();
 
-  // Feel free to add more if statements to control more GPIOs with MQTT
-
-  // If a message is received on the topic esp32/output, you check if the message is either "on" or "off". 
-  // Changes the output state according to the message
-  if (String(topic) == "ESP32/SET/LED/ACMAINS") {
-    Serial.print("Changing output to ");
-    if(messageTemp == "ON"){
-      Serial.println("ON");
-      digitalWrite(ledPin, HIGH);
+  // Test for PIN SETS
+  if (String(topic) == "SET/PIN/ACMAINS") {
+    if(strMqttRxdMsg == "ON"){
+      digitalWrite(pinoutACMAIN, HIGH);
     }
-    else if(messageTemp == "OFF"){
-      Serial.println("OFF");
-      digitalWrite(ledPin, LOW);
+    else if(strMqttRxdMsg == "OFF"){
+      digitalWrite(pinoutACMAIN, LOW);
+    }
+  }
+
+  else if (String(topic) == "SET/PIN/AUXFAN") {
+      if(strMqttRxdMsg == "ON"){
+          digitalWrite(pinoutAUXFAN, HIGH);
+      }
+      else if(strMqttRxdMsg == "OFF"){
+          digitalWrite(pinoutAUXFAN, LOW);
+      }
+  }
+
+  else  if (String(topic) == "SET/PIN/EVAPPUMP") {
+    if(strMqttRxdMsg == "ON"){
+      digitalWrite(pinoutEVAPPUMP, HIGH);
+    }
+    else if(strMqttRxdMsg == "OFF"){
+      digitalWrite(pinoutEVAPPUMP, LOW);
     }
   }
 }
 
+/*-------------Begin OLED Task Code-------------------------------*/
+/** Task handle for the MQTT publish task */
+TaskHandle_t thdlOled = NULL;
+/** Ticker for Mqtt Publishing */
+Ticker tkrTriggerOled;
+/* Flag if main loop is running */
+bool bTaskOledEnabled = false;
+
+/**
+ * triggerOledWr
+ * Resume task to draw new display
+ * called by Ticker tkrOledWr
+ */
+void triggerOledWr() {
+  if (thdlOled != NULL) {
+     xTaskResumeFromISR(thdlOled );
+      Serial.println("Oled Write Task: Resumed");
+  }else{
+      Serial.println("Oled Write Task: Disabled");
+  }
+}
+
+/**
+ * Task to redraw Oled screen
+ * @param pvParameters
+ *    pointer to task parameters
+ */
+void tskOledWr(void *pvParameters) {
+  String str="";
+  
+  Serial.println("Oled Task loop started");
+  while (1) // Oled task loop
+  {
+    if (bTaskOledEnabled) { // Send only if data was not yet processed
+        dispRedraw();  
+    }
+    vTaskSuspend(NULL);
+  }
+}
+
+void CreateTaskOledWr(void)
+{
+    // Start task to get temperature from 1 wire
+  xTaskCreatePinnedToCore(
+      tskOledWr,                      /* Function to implement the task */
+      "Oled Write",                    /* Name of the task */
+      2000,                          /* Stack size in words */
+      NULL,                          /* Task input parameter */
+      2,                              /* Priority of the task */
+      &thdlOled,                /* Task handle. */
+      1);                            /* Core where the task should run */
+
+  if (thdlOled == NULL) {
+    Serial.println("[ERROR] Failed to start task for Oled Writing");
+    delay(5000);
+  } else {
+    // Redraw every x seconds
+    tkrTriggerOled.attach(5, triggerOledWr);
+  }
+
+  // Signal end of setup() to Oled task 
+  bTaskOledEnabled = true;
+
+  // by default, we'll generate the high voltage from the 3.3v line internally! (neat!)
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);  // initialize with the I2C addr 0x3D (for the 128x64)
+
+  
+  // Clear the buffer.
+  display.clearDisplay();
+  display.display();
+  
+
+  // DRaw my Signal Strength bmp
+  display.drawBitmap(0, 0,  logo16_glcd_bmp, 12, 8, 1);
+  display.display();
+
+  // Draw my Snowflake bmp  X,Y, array u8  Wid,Hght,color
+  display.drawBitmap(100, 0,  bmpSnow16x16, 16, 15, 1);
+  display.display();
+
+}
+
+void dispRedraw(void){
+  static uint8_t loop;
+  
+  //Serial.print("DISP BTN: "); Serial.print(dispIdx); Serial.println(" State");
+  display.fillRect(0, 18, 128, 8, BLACK);
+  // text display tests
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0,18);
+  display.print("CH0 "); display.print(tempCH[0]); display.println("'F");
+  display.setTextColor(WHITE); 
+  display.display();
+
+  display.fillRect(0, 28, 128, 8, BLACK);
+  // text display tests
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0,28);
+  display.print("CH1 "); display.print(tempCH[1]); display.println("'F");
+  display.setTextColor(WHITE); 
+  display.display();
+
+  display.fillRect(0, 40, 128, 8, BLACK);
+  // text display tests
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0,40);
+  display.print("CH2 "); display.print(tempCH[2]); display.println("'F");
+  display.setTextColor(WHITE); 
+  display.display();
+
+  display.fillRect(0, 50, 128, 16, BLACK);
+  // text display tests
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0,50);
+  display.print(String(strMqttRxdTopic + " " + strMqttRxdMsg));
+  display.setTextColor(WHITE); 
+  display.display(); 
+}
+
+
+/*-------------END OLED Task Code---------------------------------*/
 
 void setup() {
   Serial.begin(115200);
-  
-  pinMode(ledPin, OUTPUT);
 
+  pinMode(pinoutACMAIN,OUTPUT);
+  pinMode(pinoutAUXFAN,OUTPUT);
+  pinMode(pinoutEVAPPUMP,OUTPUT);
+  
+  pinMode(pininDISPMODE,INPUT_PULLUP);
+  pinMode(pininCOOLMODE,INPUT_PULLUP);
+  pinMode(pininH20,INPUT_PULLUP);
+  
+  // init 1-wire code to read DS18B20 sensors
   InitOneWireSensors();
   
-  
+  // setup Wifi Client for my home SSID(s)
   setup_wifi();
+  // start mqtt server listening on port....
   client.setServer(mqtt_server,mqtt_port);
+  // assign callback for MQTT received topics
   client.setCallback(callback);
 
   // Creates Task to periodically poll 1 wire sensors
@@ -429,6 +617,9 @@ void setup() {
 
   // Creates Task to periodically publish MQTT data
   CreateTaskPubMqtt();
+
+  // Create Task that performs redraws of the Oled Display
+  CreateTaskOledWr();
 }
 
 
@@ -449,8 +640,8 @@ void setup_wifi() {
   }
 
   Serial.println("");
-  Serial.println("WiFi connected");
-  Serial.println("IP address: ");
+  Serial.print("WiFi connected   ");
+  Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
 }
 
@@ -475,9 +666,14 @@ void loop() {
        if (client.connect(mqtt_server,mqtt_user, mqtt_pass)) {
         Serial.println("Connected to MQTT server");
         
-        //Subscribe code
+        //Subscribe to topics associated to my HVAC
         client.setCallback(callback);
-        client.subscribe("ESP32/SET/LED/ACMAINS");
+        client.subscribe("SET/PIN/ACMAINS");
+        Serial.println("Subscribed to Topic SET/LED/ACMAINS");
+        client.subscribe("SET/PIN/AUXFAN");
+        Serial.println("Subscribed to Topic SET/LED/AUXFAN");
+        client.subscribe("SET/PIN/EVAPPUMP");
+        Serial.println("Subscribed to Topic SET/LED/EVAPPUMP");
         
       } else {
         Serial.println("Could not connect to MQTT server");   
@@ -494,13 +690,11 @@ void loop() {
        Serial.println("Got New 1-Wire Temps....");   
        gotNewTempData  = false;      
   }
-
   /*-------------------Allow Next Mqtt Publish------------------------------------------------*/
   if (bSentMqtt) {
        Serial.println("Published Mqtt to broker ....");  
        bSentMqtt  = false;
-  }
-    
+  } 
 }
 char* string2char(String command){
     if(command.length()!=0){
